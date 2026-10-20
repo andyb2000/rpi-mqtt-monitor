@@ -23,6 +23,20 @@ POLL_SECONDS = 1.0
 RETRY_SECONDS = 30
 
 
+def build_match_rules():
+    """Return (bus_rule, local_rule) for logind's PrepareForSleep signal.
+
+    bus_rule is registered with AddMatch: the bus daemon resolves the well-known
+    sender name, so only the real logind can trigger us. local_rule is jeepney's
+    in-process filter, which compares the sender header literally; signals carry
+    logind's unique name (e.g. ':1.2'), so it must not include the sender.
+    """
+    from jeepney import MatchRule
+    fields = dict(type='signal', path=LOGIN1_PATH, interface=LOGIN1_IFACE,
+                  member='PrepareForSleep')
+    return MatchRule(sender=LOGIN1_NAME, **fields), MatchRule(**fields)
+
+
 class SleepMonitor:
     def __init__(self, on_sleep, on_wake, stop_event, app_name='rpi-mqtt-monitor'):
         """on_sleep() runs before suspend while we still hold the inhibitor lock;
@@ -36,22 +50,21 @@ class SleepMonitor:
     def run(self):
         """Thread entry point. Returns if jeepney or logind is unavailable."""
         try:
-            from jeepney import DBusAddress, MatchRule, message_bus, new_method_call
+            from jeepney import DBusAddress, message_bus, new_method_call
             from jeepney.io.blocking import open_dbus_connection, Proxy
         except ImportError:
             print("Sleep state: jeepney is not installed (pip install jeepney); feature disabled.")
             return
 
         self._jeepney = (DBusAddress, new_method_call)
-        rule = MatchRule(type='signal', sender=LOGIN1_NAME, path=LOGIN1_PATH,
-                         interface=LOGIN1_IFACE, member='PrepareForSleep')
+        bus_rule, local_rule = build_match_rules()
 
         while not self.stop_event.is_set():
             conn = None
             try:
                 conn = open_dbus_connection(bus='SYSTEM', enable_fds=True)
-                Proxy(message_bus, conn).AddMatch(rule)
-                with conn.filter(rule, bufsize=8) as queue:
+                Proxy(message_bus, conn).AddMatch(bus_rule)
+                with conn.filter(local_rule, bufsize=8) as queue:
                     self._take_lock(conn)
                     print("Sleep state: watching for suspend/resume via logind.")
                     self._loop(conn, queue)
